@@ -1,8 +1,8 @@
 from botbuilder.core import TurnContext, CardFactory, MessageFactory
 from cards.welcome_card import get_welcome_card
-from cards.ticket_card import get_ticket_form_card, get_ticket_created_card
 from services import connectwise_service as cw
 from services import rmm_service as rmm
+from dialogs.slot_filling import is_active, start_slot_filling, handle_slot_turn
 
 # ── Intent keyword patterns ────────────────────────────────────────────────────
 INTENT_PATTERNS = [
@@ -88,6 +88,13 @@ async def handle_turn(context: TurnContext, conversation_data: dict):
 
     activity   = context.activity
     value      = activity.value or {}
+
+    # ── Slot-filling in progress — route all turns there first ────────────────
+    if is_active(conversation_data):
+        reply = await handle_slot_turn(conversation_data, activity.text or "")
+        await context.send_activity(reply)
+        return
+
     intent     = value.get("intent") or detect_intent(activity.text)
 
     from_prop  = activity.from_property
@@ -106,47 +113,8 @@ async def handle_turn(context: TurnContext, conversation_data: dict):
         await context.send_activity(MessageFactory.attachment(card))
 
     elif intent == "CREATE_TICKET":
-        card = CardFactory.adaptive_card(get_ticket_form_card())
-        await context.send_activity(MessageFactory.attachment(card))
-
-    elif intent == "SUBMIT_TICKET":
-        summary  = (value.get("ticketSummary") or "").strip()
-        priority = value.get("ticketPriority") or "Medium"
-
-        if not summary:
-            await context.send_activity(
-                "Please enter a description of your issue before submitting."
-            )
-            card = CardFactory.adaptive_card(get_ticket_form_card())
-            await context.send_activity(MessageFactory.attachment(card))
-            return
-
-        board, ticket_type, _ = triage_ticket(summary)
-        await context.send_activity(
-            f"🔍 I have categorised your issue as **{ticket_type}** "
-            f"with **{priority}** priority. Creating your ticket now..."
-        )
-
-        try:
-            ticket = cw.create_ticket(
-                summary=summary,
-                priority=priority,
-                board=board,
-                ticket_type=ticket_type,
-                user_name=full_name
-            )
-            card = CardFactory.adaptive_card(get_ticket_created_card(ticket))
-            await context.send_activity(MessageFactory.attachment(card))
-
-            # Store ticket ID for follow-up actions in this conversation
-            conversation_data["lastTicketId"] = ticket.get("id")
-
-        except Exception as e:
-            await context.send_activity(
-                f"⚠️ I could not create the ticket right now.\n\n"
-                f"Error: {str(e)}\n\n"
-                f"Please contact your helpdesk directly."
-            )
+        reply = start_slot_filling(conversation_data, activity.text or "")
+        await context.send_activity(reply)
 
     elif intent == "RUN_DIAGNOSTICS":
         await context.send_activity(

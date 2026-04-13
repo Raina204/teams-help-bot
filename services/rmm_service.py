@@ -2,17 +2,19 @@ import time
 import requests
 from config.config import CONFIG
 
-# Cached session token (exchanged from the UI JWT via /api/auth/authenticate)
+
+# Cached access token (exchanged from the UI JWT via /api/auth/authenticate)
 _session_token: str = ""
 _session_expires_at: float = 0.0
 
 
 def _get_session_token() -> str:
     """
-    N-central uses a two-step auth flow:
+    N-central two-step auth:
       1. POST /api/auth/authenticate  with Authorization: Bearer <ui-jwt>
-      2. Use the returned session token as Bearer on all subsequent calls.
-    Session tokens are cached for 20 minutes to avoid repeated round-trips.
+      2. Parse the returned access token (nested under tokens.access.token)
+      3. Use that access token as Bearer on all subsequent calls.
+    Access tokens last 60 minutes; cached for 50 to avoid expiry mid-request.
     """
     global _session_token, _session_expires_at
 
@@ -22,7 +24,8 @@ def _get_session_token() -> str:
     if not CONFIG.NABLE_JWT_TOKEN:
         raise Exception(
             "NABLE_JWT_TOKEN is not set in .env. "
-            "Generate your token from N-central User Management."
+            "Generate it from N-central: Administration > "
+            "User Management > <your user> > API Access > Generate JSON Web Token."
         )
 
     r = requests.post(
@@ -36,35 +39,32 @@ def _get_session_token() -> str:
     )
 
     if r.status_code == 401:
-        body = r.text
-        if "DmsLoginException" in body or "DMS" in body:
-            raise Exception(
-                "N-central authentication failed — the server's internal DMS "
-                "could not validate your user. This usually means:\n"
-                "  1. Your JWT token was generated on a different N-central server "
-                f"     (not {CONFIG.NABLE_BASE_URL}).\n"
-                "  2. Your account doesn't exist on this N-central instance.\n"
-                "  3. The N-central DMS service is temporarily down.\n"
-                "Log into this specific server and regenerate the token under "
-                "User Management > API Access."
-            )
         raise Exception(
-            f"N-central JWT rejected (401). Regenerate from "
-            f"{CONFIG.NABLE_BASE_URL} > User Management > API Access."
+            f"N-central rejected the JWT (401): {r.text[:300]}\n"
+            "Regenerate the token: log into "
+            f"{CONFIG.NABLE_BASE_URL} > Administration > User Management > "
+            "your user > API Access > Generate JSON Web Token."
         )
 
     r.raise_for_status()
 
     data = r.json()
-    token = data.get("token") or data.get("access_token") or data.get("jwt") or ""
+    # N-central returns: {"tokens": {"access": {"token": "...", "type": "bearer"}, "refresh": {...}}}
+    # Fall back to flat fields for older versions.
+    token = (
+        ((data.get("tokens") or {}).get("access") or {}).get("token")
+        or data.get("token")
+        or data.get("access_token")
+        or ""
+    )
     if not token:
         raise Exception(
-            f"Authenticated with N-central but response had no token field. "
-            f"Response: {r.text[:200]}"
+            f"Authenticated with N-central but could not find access token in response. "
+            f"Response: {r.text[:300]}"
         )
 
     _session_token = token
-    _session_expires_at = time.time() + 20 * 60  # cache for 20 minutes
+    _session_expires_at = time.time() + 50 * 60  # access token expires in 60 min
     return _session_token
 
 
@@ -131,18 +131,27 @@ def find_device_by_user(username: str, user_email: str = "") -> dict:
     lower_user = username.lower()
     first_name = lower_user.split(".")[0]
 
+    def _extract_username(raw: str) -> str:
+        """Strip DOMAIN\ prefix from lastLoggedInUser."""
+        raw = (raw or "").lower()
+        return raw.split("\\")[-1] if "\\" in raw else raw
+
+    # 1. Exact match on the username part (after DOMAIN\)
     for d in devices:
-        if lower_user in (d.get("lastLoggedInUser") or "").lower():
+        if lower_user == _extract_username(d.get("lastLoggedInUser", "")):
             return d
 
+    # 2. Partial match on username part
     for d in devices:
+        if lower_user in _extract_username(d.get("lastLoggedInUser", "")):
+            return d
+
+    # 3. First name match against username or device name
+    for d in devices:
+        if first_name in _extract_username(d.get("lastLoggedInUser", "")):
+            return d
         if first_name in (d.get("longName") or "").lower():
             return d
-
-    for d in devices:
-        for field in ["userName", "lastLoggedInUser", "longName"]:
-            if first_name in (d.get(field) or "").lower():
-                return d
 
     raise Exception(
         f"No device found for user '{username}' under "
@@ -153,10 +162,7 @@ def find_device_by_user(username: str, user_email: str = "") -> dict:
 
 def run_script(device_id: int, script_id: int) -> dict:
     if not script_id or script_id == 0:
-        raise Exception(
-            f"Script ID is 0 or not set. "
-            "Create the script in N-central and update the ID in .env."
-        )
+        return {"mock": True}
 
     url     = f"{CONFIG.NABLE_BASE_URL}/api/scheduled-tasks/direct"
     payload = {
@@ -183,6 +189,9 @@ def run_script(device_id: int, script_id: int) -> dict:
 
 
 def _get_script_output(device_id: int, script_id: int) -> str:
+    if not script_id or script_id == 0:
+        return ""
+
     url    = f"{CONFIG.NABLE_BASE_URL}/api/scheduled-tasks/status"
     params = {"deviceId": device_id, "taskItemId": script_id}
 
@@ -231,7 +240,7 @@ def _build_diagnostics(device: dict, outputs: dict) -> dict:
     return {
         "device": {
             "name": device.get("longName", "Unknown"),
-            "os":   f"{device.get('osName','')} {device.get('osVersion','')}".strip()
+            "os":   device.get("supportedOs") or device.get("supportedOsLabel") or "Unknown"
         },
         "memory": {
             "usedPercent": round(mem_pct),
@@ -261,11 +270,14 @@ def run_diagnostics(user_name: str, user_email: str) -> dict:
     device    = find_device_by_user(username, user_email)
     device_id = device["deviceId"]
 
+    scripts_configured = all(CONFIG.NABLE_SCRIPTS[k] for k in ("memory", "cpu", "storage"))
+
     run_script(device_id, CONFIG.NABLE_SCRIPTS["memory"])
     run_script(device_id, CONFIG.NABLE_SCRIPTS["cpu"])
     run_script(device_id, CONFIG.NABLE_SCRIPTS["storage"])
 
-    time.sleep(30)
+    if scripts_configured:
+        time.sleep(30)
 
     outputs = {
         "memory":  _get_script_output(device_id, CONFIG.NABLE_SCRIPTS["memory"]),
@@ -288,8 +300,11 @@ def reset_outlook(user_name: str, user_email: str) -> dict:
 
     run_script(device_id, CONFIG.NABLE_SCRIPTS["outlook_reset"])
 
+    mock = not CONFIG.NABLE_SCRIPTS["outlook_reset"]
     return {
         "message": (
+            f"[MOCK] Outlook reset would be sent to {device['longName']} — set NABLE_SCRIPT_OUTLOOK_RESET in .env for production."
+            if mock else
             f"Outlook reset script sent to {device['longName']} via N-able N-central. "
             "Outlook will close and reopen automatically within 30 seconds."
         ),
