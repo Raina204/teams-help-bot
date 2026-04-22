@@ -85,18 +85,58 @@ def get_ticket(ticket_id: int) -> dict:
     return response.json()
 
 
-def get_tickets_by_company(company_id: int, status: str = "New") -> list:
-    """Retrieves open tickets for a given company."""
-    url = f"{CONFIG.CW_SITE}/v4_6_release/apis/3.0/service/tickets"
+def find_company_by_name(name: str) -> list[dict]:
+    """Searches for companies in ConnectWise by name (partial match)."""
+    url = f"{CONFIG.CW_SITE}/v4_6_release/apis/3.0/company/companies"
     params = {
-        "conditions": f"company/id={company_id} and status/name='{status}'",
-        "pageSize": 25
+        "conditions": f"name contains '{name}'",
+        "fields":     "id,name,status",
+        "pageSize":   10,
     }
-    response = requests.get(
-        url, params=params, headers=_get_headers(), timeout=15
-    )
+    response = requests.get(url, params=params, headers=_get_headers(), timeout=15)
     if not response.ok:
-        raise Exception(
-            f"HTTP {response.status_code} — {response.text[:500]}"
-        )
+        raise Exception(f"HTTP {response.status_code} — {response.text[:500]}")
     return response.json()
+
+
+# Common status name variants used across ConnectWise environments
+_STATUS_ALIASES: dict[str, list[str]] = {
+    "new":         ["New (not responded)", "New", "New Request"],
+    "open":        ["Open", "In Progress", "Assigned"],
+    "inprogress":  ["In Progress", "Working", "Assigned"],
+    "closed":      ["Closed", "Completed", "Resolved"],
+    "waiting":     ["Waiting Customer", "Waiting on Customer", "Pending Customer"],
+}
+
+
+def get_tickets_by_company(company_id: int, status: str = "New (not responded)") -> list:
+    """Retrieves open tickets for a given company, trying status aliases if exact match returns nothing."""
+    url = f"{CONFIG.CW_SITE}/v4_6_release/apis/3.0/service/tickets"
+
+    def _fetch(status_name: str) -> list:
+        params = {
+            "conditions": f"company/id={company_id} and status/name='{status_name}'",
+            "pageSize":   50,
+        }
+        r = requests.get(url, params=params, headers=_get_headers(), timeout=15)
+        if not r.ok:
+            raise Exception(f"HTTP {r.status_code} — {r.text[:500]}")
+        return r.json()
+
+    # Try exact status first
+    results = _fetch(status)
+    if results:
+        return results
+
+    # Try aliases for the normalised key
+    key = status.lower().replace(" ", "").replace("(", "").replace(")", "")
+    for alias_key, variants in _STATUS_ALIASES.items():
+        if alias_key in key or key in alias_key:
+            for variant in variants:
+                if variant == status:
+                    continue
+                results = _fetch(variant)
+                if results:
+                    return results
+
+    return []
