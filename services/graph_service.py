@@ -15,10 +15,9 @@ async def _get_token(user_tenant_id: str = None) -> str:
     scoped to their tenant.
     Falls back to the bot's own tenant if none supplied.
     """
-    tenant_id     = user_tenant_id or os.environ["MICROSOFT_APP_TENANT_ID"]
-    client_id     = os.environ["MICROSOFT_APP_ID"]
-    client_secret = os.environ["MICROSOFT_APP_PASSWORD"]
-
+    tenant_id     = user_tenant_id or os.environ["AZURE_TENANT_ID"]
+    client_id     = os.environ["AZURE_CLIENT_ID"]
+    client_secret = os.environ["AZURE_CLIENT_SECRET"]
 
     url  = f"https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
     data = {

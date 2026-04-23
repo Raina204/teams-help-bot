@@ -10,7 +10,7 @@ Tool categories
   ConnectWise  →  mcp_create_ticket, mcp_add_note,
                   mcp_get_ticket,    mcp_get_tickets_by_company
   N-able RMM   →  mcp_find_device,   mcp_run_diagnostics,
-                  mcp_reset_outlook
+                  mcp_reset_outlook, mcp_change_timezone
 """
 
 from __future__ import annotations
@@ -32,10 +32,12 @@ from services.connectwise_service import (
     get_tickets_by_company,
 )
 from services.rmm_service import (
+    change_timezone,
     find_device_by_user,
     reset_outlook,
     run_diagnostics,
 )
+from services.timezone_service import IANA_TO_WINDOWS
 from dialogs.slot_filling import (
     is_active,
     start_slot_filling,
@@ -192,12 +194,14 @@ def mcp_get_tickets_by_company(
     List tickets for a specific company in ConnectWise.
 
     If you only have a company name (not ID), call mcp_find_company first.
-    Common status values: "New (not responded)", "In Progress", "Waiting Customer", "Closed".
+    Common status values: "New (not responded)", "In Progress",
+    "Waiting Customer", "Closed".
     If the requested status returns no results, variants are tried automatically.
 
     Args:
         company_id: Numeric ConnectWise company ID.
-        status:     Ticket status to filter by. Defaults to 'New (not responded)'.
+        status:     Ticket status to filter by. Defaults to
+                    'New (not responded)'.
 
     Returns:
         List of dicts with ticket_id, summary, status, priority.
@@ -253,7 +257,8 @@ def mcp_run_diagnostics(user_name: str, user_email: str = "") -> dict:
 
     Args:
         user_name:  Username or display name.
-        user_email: Email address used to resolve the correct N-central customer.
+        user_email: Email address used to resolve the correct N-central
+                    customer.
 
     Returns:
         dict with device info, memory %, CPU %, and storage breakdown.
@@ -264,17 +269,255 @@ def mcp_run_diagnostics(user_name: str, user_email: str = "") -> dict:
 @mcp.tool()
 def mcp_reset_outlook(user_name: str, user_email: str = "") -> dict:
     """
-    Execute the Outlook reset/refresh automation script on the user's
-    machine through N-able N-central.
+    Run the Outlook reset script on the user's machine via N-able N-central.
 
-    Use this when the user reports Outlook freezing, crashing, or failing
-    to sync email.
+    Closes Outlook, clears the profile cache and OST files, then relaunches.
+    Use this when a user reports Outlook not syncing, crashing, or calendar
+    issues.
 
     Args:
         user_name:  Username or display name.
-        user_email: Email address used to resolve the correct N-central customer.
+        user_email: Email address used to resolve the correct N-central
+                    customer.
 
     Returns:
-        dict with device name and script execution status/message.
+        dict with message and device name confirming the reset was triggered.
     """
     return reset_outlook(user_name=user_name, user_email=user_email)
+
+
+@mcp.tool()
+def mcp_change_timezone(
+    user_name:      str,
+    user_email:     str,
+    iana_timezone:  str,
+    windows_timezone: str = "",
+) -> dict:
+    """
+    Remotely change the Windows system timezone on the user's device
+    via N-able N-central RMM.
+
+    This changes the actual device clock — not just Outlook or Teams calendar.
+    The change takes effect immediately with no restart required.
+
+    Use this whenever a user asks to change their timezone, set a different
+    time zone, or reports their clock is showing the wrong time.
+
+    Args:
+        user_name:        Display name of the user (e.g. John Smith).
+        user_email:       Email address used to find the user's device.
+        iana_timezone:    IANA timezone name e.g. Asia/Tokyo, America/New_York.
+        windows_timezone: Windows timezone name e.g. Tokyo Standard Time.
+                          Resolved automatically from iana_timezone if omitted.
+
+    Returns:
+        dict with success, device name, timezone applied, and confirmation
+        message. Includes _mock=True when running without a configured script.
+
+    Common IANA → Windows mappings:
+        America/New_York    → Eastern Standard Time
+        America/Chicago     → Central Standard Time
+        America/Denver      → Mountain Standard Time
+        America/Los_Angeles → Pacific Standard Time
+        Europe/London       → GMT Standard Time
+        Europe/Paris        → W. Europe Standard Time
+        Asia/Tokyo          → Tokyo Standard Time
+        Asia/Kolkata        → India Standard Time
+        Asia/Dubai          → Arabian Standard Time
+        Asia/Singapore      → Singapore Standard Time
+        Asia/Karachi        → Pakistan Standard Time
+        Australia/Sydney    → AUS Eastern Standard Time
+        UTC                 → UTC
+    """
+    # Resolve Windows timezone name from IANA if not provided
+    resolved_windows_tz = windows_timezone or IANA_TO_WINDOWS.get(iana_timezone, "")
+
+    if not resolved_windows_tz:
+        return {
+            "success": False,
+            "error": (
+                f"No Windows timezone mapping found for '{iana_timezone}'. "
+                f"Please provide the windows_timezone parameter explicitly."
+            ),
+        }
+
+    return change_timezone(
+        user_name  = user_name,
+        user_email = user_email,
+        windows_tz = resolved_windows_tz,
+        iana_tz    = iana_timezone,
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# OpenAI tool definitions + dispatcher  (used by llm_service and orchestrator)
+# ═════════════════════════════════════════════════════════════════════════════
+
+TOOL_DEFINITIONS: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "create_ticket",
+            "description": "Create a new IT support ticket in ConnectWise Manage.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "summary":     {"type": "string", "description": "One-line summary of the issue."},
+                    "description": {"type": "string", "description": "Detailed description of the issue."},
+                    "priority":    {"type": "string", "enum": ["High", "Medium", "Low", "urgent"],
+                                   "description": "Ticket priority."},
+                },
+                "required": ["summary", "priority"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "triage_ticket",
+            "description": "Triage an existing ConnectWise ticket to set the correct board and type.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ticket_id": {"type": "integer", "description": "Numeric ConnectWise ticket ID."},
+                },
+                "required": ["ticket_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "lookup_user_device",
+            "description": "Find the user's managed device in N-able N-central.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_name":  {"type": "string", "description": "Display name of the user."},
+                    "user_email": {"type": "string", "description": "Email address of the user."},
+                },
+                "required": ["user_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_outlook_reset",
+            "description": "Reset the Outlook profile on the user's device via N-able N-central.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_name":          {"type": "string", "description": "Display name of the user."},
+                    "user_email":         {"type": "string", "description": "Email address of the user."},
+                    "machine_identifier": {"type": "string", "description": "Device name or ID (optional)."},
+                },
+                "required": ["user_name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_utilization_scan",
+            "description": "Run a CPU, memory, and/or storage diagnostic scan on the user's device.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "user_name":          {"type": "string", "description": "Display name of the user."},
+                    "user_email":         {"type": "string", "description": "Email address of the user."},
+                    "machine_identifier": {"type": "string", "description": "Device name or ID (optional)."},
+                    "scan_type":          {"type": "string", "enum": ["all", "cpu", "memory", "storage"],
+                                         "description": "Which scan to run."},
+                },
+                "required": ["user_name", "scan_type"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "change_device_timezone",
+            "description": (
+                "Remotely change the Windows system timezone on the user's device "
+                "via N-able N-central RMM."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "iana_timezone":    {"type": "string",
+                                        "description": "IANA timezone name e.g. Asia/Tokyo."},
+                    "windows_timezone": {"type": "string",
+                                        "description": "Windows timezone name e.g. Tokyo Standard Time."},
+                    "user_name":        {"type": "string", "description": "Display name of the user."},
+                    "user_email":       {"type": "string", "description": "Email address of the user."},
+                },
+                "required": ["iana_timezone", "user_name", "user_email"],
+            },
+        },
+    },
+]
+
+
+def execute_tool(name: str, args: dict) -> str:
+    """Dispatch an LLM tool call to the appropriate service function."""
+    import json as _json
+
+    user_name  = args.get("user_name", "")
+    user_email = args.get("user_email", "")
+
+    try:
+        if name == "create_ticket":
+            result = create_ticket(
+                summary   = args.get("summary", ""),
+                priority  = args.get("priority", "Medium"),
+                board     = CONFIG.CW_DEFAULT_BOARD,
+                user_name = user_name,
+            )
+            return _json.dumps({
+                "ticket_id": result.get("id"),
+                "summary":   result.get("summary"),
+                "status":    (result.get("status") or {}).get("name"),
+            })
+
+        if name == "triage_ticket":
+            ticket = get_ticket(ticket_id=int(args.get("ticket_id", 0)))
+            return _json.dumps({
+                "ticket_id": ticket.get("id"),
+                "status":    (ticket.get("status") or {}).get("name"),
+                "priority":  (ticket.get("priority") or {}).get("name"),
+            })
+
+        if name == "lookup_user_device":
+            device = find_device_by_user(username=user_name, user_email=user_email)
+            return _json.dumps({
+                "device_id":   device.get("deviceId"),
+                "device_name": device.get("longName"),
+                "os":          device.get("supportedOsLabel") or device.get("supportedOs"),
+            })
+
+        if name == "run_outlook_reset":
+            result = reset_outlook(user_name=user_name, user_email=user_email)
+            return _json.dumps(result)
+
+        if name == "run_utilization_scan":
+            result = run_diagnostics(user_name=user_name, user_email=user_email)
+            return _json.dumps(result)
+
+        if name == "change_device_timezone":
+            iana_tz    = args.get("iana_timezone", "")
+            windows_tz = args.get("windows_timezone") or IANA_TO_WINDOWS.get(iana_tz, "")
+            if not windows_tz:
+                return _json.dumps({"error": f"No Windows mapping for '{iana_tz}'."})
+            result = change_timezone(
+                user_name  = user_name,
+                user_email = user_email,
+                windows_tz = windows_tz,
+                iana_tz    = iana_tz,
+            )
+            return _json.dumps(result)
+
+        return _json.dumps({"error": f"Unknown tool: {name}"})
+
+    except Exception as exc:
+        return _json.dumps({"error": str(exc), "tool": name})

@@ -30,10 +30,19 @@ RULES — follow these strictly:
 7. If a tool returns an error field, tell the user clearly and suggest they email support@company.com.
 
 TIMEZONE CHANGES — follow these steps exactly:
-8. When a user asks to change timezone, identify the IANA and Windows timezone names.
-9. Call apply_timezone_change with iana_timezone and windows_timezone.
-10. Report back the result — confirm the timezone is now updated on their account.
-11. Ask if they want a ConnectWise ticket logged for this change.
+8. When a user asks to change their timezone, identify the correct
+   IANA timezone name and Windows timezone name from their message.
+9. Call change_device_timezone with iana_timezone and windows_timezone.
+   This will run a script on the user's actual Windows device via N-able RMM
+   and change the system clock immediately.
+10. Report the result back to the user — confirm the timezone was changed
+    on their device and the name of the device it was changed on.
+11. Ask: "Would you like me to log a ConnectWise ticket for this change?"
+12. If the user says yes, call create_ticket immediately with:
+      summary     : "Timezone change — [Display Name]"
+      description : "Timezone changed to [IANA] ([Windows TZ]) on [device name] via N-able RMM."
+      priority    : Low
+    Do NOT ask for more information before creating the ticket.
 
 COMMON TIMEZONE MAPPINGS (IANA → Windows):
   America/New_York    → Eastern Standard Time
@@ -116,11 +125,9 @@ class McpOrchestrator:
                 "role": "system",
                 "content": (
                     "The user is asking about a timezone change. "
-                    "You MUST respond with the exact OS commands as instructed in your system prompt. "
-                    "Do NOT say you are unable to change timezone settings. "
-                    "Provide the Windows tzutil command, the macOS systemsetup command, "
-                    "and the Linux timedatectl command. "
-                    "Then ask if they want a ConnectWise ticket logged for this change."
+                    "You MUST call change_device_timezone with the correct iana_timezone and windows_timezone. "
+                    "Do NOT provide manual OS commands — the tool will apply the change directly on the user's device. "
+                    "After the tool returns, confirm the result to the user and ask if they want a ConnectWise ticket logged."
                 ),
             })
 

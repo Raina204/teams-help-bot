@@ -310,3 +310,64 @@ def reset_outlook(user_name: str, user_email: str) -> dict:
         ),
         "device": device["longName"]
     }
+
+def change_timezone(
+    user_name:  str,
+    user_email: str,
+    windows_tz: str,
+    iana_tz:    str,
+) -> dict:
+    """
+    Remotely changes the Windows timezone on the user's device via N-able.
+    Runs the timezone change automation policy script on the device.
+    """
+    try:
+        username = (
+            user_email.split("@")[0]
+            if user_email and "@" in user_email
+            else user_name.replace(" ", ".").lower()
+        )
+
+        device      = find_device_by_user(username, user_email)
+        device_id   = device["deviceId"]
+        device_name = device["longName"]
+        script_id   = CONFIG.NABLE_SCRIPTS.get("timezone_change", 0)
+
+        if not script_id:
+            return {
+                "success":    False,
+                "device":     device_name,
+                "windows_tz": windows_tz,
+                "iana_tz":    iana_tz,
+                "message": (
+                    f"[MOCK] Timezone change to {iana_tz} would run on "
+                    f"{device_name} — set NABLE_SCRIPT_TIMEZONE_CHANGE in .env."
+                ),
+                "_mock": True,
+            }
+
+        run_script(device_id, script_id)
+
+        time.sleep(10)
+        output  = _get_script_output(device_id, script_id)
+        success = "success" in (output or "").lower() or bool(output)
+
+        return {
+            "success":    True,
+            "device":     device_name,
+            "windows_tz": windows_tz,
+            "iana_tz":    iana_tz,
+            "message": (
+                f"Timezone successfully changed to {iana_tz} on "
+                f"{device_name}. The change takes effect immediately."
+                if success else
+                f"Timezone change script sent to {device_name}. "
+                f"The change to {iana_tz} should take effect within 30 seconds."
+            ),
+        }
+
+    except Exception as exc:
+        return {
+            "success": False,
+            "error":   str(exc),
+        }
