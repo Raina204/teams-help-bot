@@ -42,39 +42,35 @@ _TIMEZONE_CONFIRM_NO = {
 # Intent patterns
 # ---------------------------------------------------------------------------
 
-INTENT_PATTERNS: list[tuple[str, list[str]]] = [
-    ("RUN_DIAGNOSTICS", [
-        "slow", "diagnose", "check my pc", "memory", "cpu",
-        "storage", "disk", "performance", "run pc diagnostics",
-        "run diagnostics",
-    ]),
-    ("RESET_OUTLOOK", [
-        "outlook", "email", "calendar", "mail", "ost",
-        "fix outlook", "fix my outlook", "reset outlook",
-    ]),
-    ("CHECK_TICKET", [
-        "status", "update", "my ticket", "progress",
-        "ticket number", "check my ticket status", "check ticket",
-    ]),
-    ("CONFIRM_OUTLOOK_RESET", [
-        "confirm_outlook_reset", "yes reset", "yes, reset",
-    ]),
-    ("CHANGE_TIMEZONE", [
-        "timezone", "time zone", "change time", "set timezone",
-        "change timezone", "wrong time", "clock",
-        "utc", "est", "pst", "cst", "gmt",
-        "tokyo time", "new york time", "london time",
-        "india time", "set my time",
-    ]),
-    ("MAIN_MENU", [
-        "menu", "start", "home", "hello", "hi", "hey", "help",
-    ]),
-    ("CREATE_TICKET", [
-        "ticket", "issue", "problem", "something is broken",
-        "not working", "new ticket", "create ticket",
-        "log a support ticket", "raise a ticket",
-    ]),
+INTENT_PATTERNS = [
+    # Specific intents first to prevent broad CREATE_TICKET keywords ("issue", "not
+    # working", "help") from firing before more targeted patterns.
+
+    # Printer intents
+    ("RESTART_SPOOLER",        ["restart spooler", "restart print spooler", "fix printer", "printer stuck",
+                                 "printer not responding", "reset printer", "printer problem", "can't print",
+                                 "cannot print", "print queue stuck", "spooler restart"]),
+    ("CLEAR_PRINT_QUEUE",      ["clear print queue", "clear queue", "stuck print job", "delete print jobs",
+                                 "remove print jobs", "empty print queue", "cancel print jobs"]),
+    ("LIST_PRINTERS",          ["list printers", "show printers", "what printers", "available printers",
+                                 "installed printers", "my printers", "which printer"]),
+    ("PRINTER_STATUS",         ["printer status", "check printer", "is my printer working", "printer not working",
+                                 "printer is not working", "print issue", "printing issue", "spooler status"]),
+
+    # RUN_DIAGNOSTICS before RESET_OUTLOOK: "ost" appears inside "diagnostics"
+    ("RUN_DIAGNOSTICS",        ["slow", "diagnose", "diagnostics", "check my pc", "memory",
+                                 "cpu", "storage", "disk", "performance"]),
+    ("RESET_OUTLOOK",          ["outlook", "email", "calendar", "mail", "ost", "fix outlook"]),
+    ("CHECK_TICKET",           ["status", "update", "my ticket", "progress", "ticket number"]),
+    # CHANGE_TIMEZONE includes timezone abbreviations and common phrasings
+    ("CHANGE_TIMEZONE",        ["timezone", "time zone", "change time", "set time", "clock",
+                                 "wrong time", "pst", "est", "cst", "mst", "gmt"]),
+    ("CONFIRM_OUTLOOK_RESET",  ["confirm_outlook_reset", "yes reset", "yes, reset"]),
+    # MAIN_MENU before CREATE_TICKET so "help" routes here, not to a ticket
+    ("MAIN_MENU",              ["menu", "start", "home", "hello", "hi", "hey", "help"]),
+    ("CREATE_TICKET",          ["ticket", "issue", "problem", "broken", "not working", "support"]),
 ]
+
 
 
 # ---------------------------------------------------------------------------
