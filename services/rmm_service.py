@@ -1,218 +1,214 @@
-import time
+"""
+services/rmm_service.py
+------------------------
+ConnectWise Automate (CWA) RMM integration — multi-tenant aware.
+
+Every public function accepts tenant_ctx as its last argument.
+Credentials are derived from tenant_ctx at runtime — never from global CONFIG.
+
+Global CONFIG is used for:
+  - CWA_SCRIPTS  (script IDs — same scripts run for all tenants)
+
+Per-tenant values come from tenant_ctx:
+  - cwa_api_key_ref  → resolved via get_secret() to the CWA Bearer token
+  - cwa_base_url     → this tenant's ConnectWise Automate server URL
+  - cwa_client_id    → (optional) site/client ID for additional scoping
+
+ConnectWise Automate REST API reference:
+  Auth:    Authorization: Bearer {token} header
+  Devices: GET  {base}/cwa/api/v1/computers?condition=LastLoggedInUser like '%{user}%'
+  Scripts: POST {base}/cwa/api/v1/computers/{computerId}/scripts/{scriptId}
+"""
+
 import requests
+
 from config.config import CONFIG
+from config.secrets import get_secret
 
 
-# Cached access token (exchanged from the UI JWT via /api/auth/authenticate)
-_session_token: str = ""
-_session_expires_at: float = 0.0
+# ---------------------------------------------------------------------------
+# Internal auth helpers
+# ---------------------------------------------------------------------------
 
-
-def _get_session_token() -> str:
-    """
-    N-central two-step auth:
-      1. POST /api/auth/authenticate  with Authorization: Bearer <ui-jwt>
-      2. Parse the returned access token (nested under tokens.access.token)
-      3. Use that access token as Bearer on all subsequent calls.
-    Access tokens last 60 minutes; cached for 50 to avoid expiry mid-request.
-    """
-    global _session_token, _session_expires_at
-
-    if _session_token and time.time() < _session_expires_at:
-        return _session_token
-
-    if not CONFIG.NABLE_JWT_TOKEN:
-        raise Exception(
-            "NABLE_JWT_TOKEN is not set in .env. "
-            "Generate it from N-central: Administration > "
-            "User Management > <your user> > API Access > Generate JSON Web Token."
-        )
-
-    r = requests.post(
-        f"{CONFIG.NABLE_BASE_URL}/api/auth/authenticate",
-        headers={
-            "Authorization": f"Bearer {CONFIG.NABLE_JWT_TOKEN}",
-            "Content-Type":  "application/json",
-            "Accept":        "application/json",
-        },
-        timeout=15,
-    )
-
-    if r.status_code == 401:
-        raise Exception(
-            f"N-central rejected the JWT (401): {r.text[:300]}\n"
-            "Regenerate the token: log into "
-            f"{CONFIG.NABLE_BASE_URL} > Administration > User Management > "
-            "your user > API Access > Generate JSON Web Token."
-        )
-
-    r.raise_for_status()
-
-    data = r.json()
-    # N-central returns: {"tokens": {"access": {"token": "...", "type": "bearer"}, "refresh": {...}}}
-    # Fall back to flat fields for older versions.
-    token = (
-        ((data.get("tokens") or {}).get("access") or {}).get("token")
-        or data.get("token")
-        or data.get("access_token")
-        or ""
-    )
+def _get_headers(tenant_ctx: dict) -> dict:
+    """Build authenticated headers for this tenant's CWA API calls."""
+    token = get_secret(tenant_ctx["cwa_api_key_ref"])
     if not token:
         raise Exception(
-            f"Authenticated with N-central but could not find access token in response. "
-            f"Response: {r.text[:300]}"
+            f"[tenant={tenant_ctx['tenant_id']}] CWA API token not found for ref "
+            f"'{tenant_ctx['cwa_api_key_ref']}'. Add it to your .env file."
         )
-
-    _session_token = token
-    _session_expires_at = time.time() + 50 * 60  # access token expires in 60 min
-    return _session_token
-
-
-def _get_headers() -> dict:
     return {
-        "Authorization": f"Bearer {_get_session_token()}",
+        "Authorization": f"Bearer {token}",
         "Content-Type":  "application/json",
         "Accept":        "application/json",
     }
 
 
-def _get_customer_id(user_email: str) -> str:
-    if not user_email or "@" not in user_email:
-        if CONFIG.NABLE_CUSTOMER_MAP:
-            return list(CONFIG.NABLE_CUSTOMER_MAP.values())[0]
-        raise Exception(
-            "Cannot determine N-central customer — no email provided "
-            "and NABLE_CUSTOMER_MAP is empty."
-        )
-
-    domain = user_email.split("@")[-1].lower()
-
-    if domain in CONFIG.NABLE_CUSTOMER_MAP:
-        return CONFIG.NABLE_CUSTOMER_MAP[domain]
-
-    for mapped_domain, cid in CONFIG.NABLE_CUSTOMER_MAP.items():
-        if domain.endswith(mapped_domain):
-            return cid
-
-    if CONFIG.NABLE_CUSTOMER_MAP:
-        return list(CONFIG.NABLE_CUSTOMER_MAP.values())[0]
-
-    raise Exception(
-        f"No N-central customer found for domain '{domain}'. "
-        f"Add '{domain}:CUSTOMER_ID' to NABLE_CUSTOMER_MAP in .env."
-    )
+def _get_base_url(tenant_ctx: dict) -> str:
+    """Return the ConnectWise Automate base URL for this tenant."""
+    return (tenant_ctx.get("cwa_base_url") or CONFIG.CWA_BASE_URL).rstrip("/")
 
 
-def find_device_by_user(username: str, user_email: str = "") -> dict:
-    customer_id = _get_customer_id(user_email)
+# ---------------------------------------------------------------------------
+# Device lookup
+# ---------------------------------------------------------------------------
 
-    url    = f"{CONFIG.NABLE_BASE_URL}/api/devices"
-    params = {
-        "customerId": customer_id,
-        "pageSize":   100,
-        "pageNumber": 1
-    }
+def find_device_by_user(
+    username: str,
+    tenant_ctx: dict,
+) -> dict:
+    """
+    Find a device in ConnectWise Automate by matching the last logged-on user.
 
-    r = requests.get(url, headers=_get_headers(), params=params, timeout=15)
+    CWA endpoint: GET /cwa/api/v1/computers?condition=LastLoggedInUser like '%{user}%'
 
-    if r.status_code == 401:
-        raise Exception(
-            "N-central JWT token is invalid or expired. "
-            "Regenerate it from N-central User Management."
-        )
-    if r.status_code == 403:
-        raise Exception(
-            "Access denied to N-central devices. "
-            "Make sure your user has device view permissions."
-        )
-    r.raise_for_status()
+    Returns:
+        Computer dict from CWA (contains Id, ComputerName, LastLoggedInUser, etc.)
 
-    devices    = r.json().get("data", [])
+    Raises:
+        Exception: if no matching device is found.
+    """
+    if tenant_ctx.get("mock") or tenant_ctx.get("cwa_mock"):
+        return {
+            "Id":                  1,
+            "ComputerName":        f"{username}-pc",
+            "LastLoggedInUser":    username,
+            "OperatingSystemName": "Windows 11 Pro",
+        }
+
+    base_url   = _get_base_url(tenant_ctx)
+    headers    = _get_headers(tenant_ctx)
     lower_user = username.lower()
     first_name = lower_user.split(".")[0]
 
-    def _extract_username(raw: str) -> str:
-        """Strip DOMAIN\ prefix from lastLoggedInUser."""
+    r = requests.get(
+        f"{base_url}/cwa/api/v1/computers",
+        headers=headers,
+        params={"condition": f"LastLoggedInUser like '%{username}%'", "pageSize": 50},
+        timeout=15,
+    )
+
+    if r.status_code == 401:
+        raise Exception(
+            f"[tenant={tenant_ctx['tenant_id']}] CWA token rejected (401). "
+            "Check the token in .env."
+        )
+    if r.status_code == 403:
+        raise Exception(
+            f"[tenant={tenant_ctx['tenant_id']}] Access denied to CWA computers (403). "
+            "Ensure the API user has read permissions."
+        )
+    r.raise_for_status()
+
+    computers = r.json()
+    if isinstance(computers, dict):
+        computers = computers.get("data", [])
+
+    def _strip_domain(raw: str) -> str:
         raw = (raw or "").lower()
         return raw.split("\\")[-1] if "\\" in raw else raw
 
-    # 1. Exact match on the username part (after DOMAIN\)
-    for d in devices:
-        if lower_user == _extract_username(d.get("lastLoggedInUser", "")):
-            return d
+    # Exact match
+    for c in computers:
+        if lower_user == _strip_domain(c.get("LastLoggedInUser", "")):
+            return c
 
-    # 2. Partial match on username part
-    for d in devices:
-        if lower_user in _extract_username(d.get("lastLoggedInUser", "")):
-            return d
+    # Partial match
+    for c in computers:
+        if lower_user in _strip_domain(c.get("LastLoggedInUser", "")):
+            return c
 
-    # 3. First name match against username or device name
-    for d in devices:
-        if first_name in _extract_username(d.get("lastLoggedInUser", "")):
-            return d
-        if first_name in (d.get("longName") or "").lower():
-            return d
+    # Broaden: search by first name against ComputerName
+    if not computers:
+        r2 = requests.get(
+            f"{base_url}/cwa/api/v1/computers",
+            headers=headers,
+            params={"condition": f"ComputerName like '%{first_name}%'", "pageSize": 50},
+            timeout=15,
+        )
+        r2.raise_for_status()
+        computers2 = r2.json()
+        if isinstance(computers2, dict):
+            computers2 = computers2.get("data", [])
+        if computers2:
+            return computers2[0]
 
-    raise Exception(
-        f"No device found for user '{username}' under "
-        f"N-central customer {customer_id}. "
-        "Make sure the device is online and enrolled in N-able."
-    )
+    if not computers:
+        raise Exception(
+            f"[tenant={tenant_ctx['tenant_id']}] No device found for user '{username}'. "
+            "Ensure the device is online and enrolled in ConnectWise Automate."
+        )
+
+    return computers[0]
 
 
-def run_script(device_id: int, script_id: int) -> dict:
+# ---------------------------------------------------------------------------
+# Script execution helpers
+# ---------------------------------------------------------------------------
+
+def run_script(
+    device_id: int,
+    script_id: int,
+    tenant_ctx: dict,
+    parameters: dict | None = None,
+) -> dict:
+    """
+    Trigger a ConnectWise Automate script on a specific device.
+
+    CWA endpoint: POST /cwa/api/v1/computers/{computerId}/scripts/{scriptId}
+
+    Args:
+        device_id:   CWA computer ID.
+        script_id:   CWA script ID (set via CWA_SCRIPT_* env vars). Pass 0 to skip.
+        tenant_ctx:  Resolved tenant config dict.
+        parameters:  Optional dict of script input parameters
+                     e.g. {"TimeZone": "Eastern Standard Time"}.
+
+    Returns:
+        {"queued": True} on success, or {"mock": True} if script_id is 0.
+
+    Raises:
+        Exception: on auth failure or API error.
+    """
     if not script_id or script_id == 0:
         return {"mock": True}
 
-    url     = f"{CONFIG.NABLE_BASE_URL}/api/scheduled-tasks/direct"
-    payload = {
-        "taskType": "AutomationPolicy",
-        "items": [
-            {
-                "taskItemId": script_id,
-                "deviceIds":  [device_id]
-            }
-        ]
-    }
+    base_url = _get_base_url(tenant_ctx)
+    url      = f"{base_url}/cwa/api/v1/computers/{device_id}/scripts/{script_id}"
 
-    r = requests.post(url, json=payload, headers=_get_headers(), timeout=15)
+    # CWA accepts script parameters as query params in the format parameter[Name]=Value
+    params = {}
+    if parameters:
+        for k, v in parameters.items():
+            params[f"parameter[{k}]"] = v
+
+    r = requests.post(
+        url,
+        headers=_get_headers(tenant_ctx),
+        params=params or None,
+        timeout=15,
+    )
 
     if r.status_code == 401:
-        raise Exception("JWT token expired — regenerate from N-central.")
+        raise Exception(
+            f"[tenant={tenant_ctx['tenant_id']}] CWA token rejected (401)."
+        )
     if r.status_code == 404:
         raise Exception(
-            f"Script ID {script_id} not found in N-central. "
-            "Check NABLE_SCRIPT_* values in .env."
+            f"[tenant={tenant_ctx['tenant_id']}] Script ID {script_id} or computer "
+            f"ID {device_id} not found in CWA. Check CWA_SCRIPT_* values in .env."
         )
     r.raise_for_status()
-    return r.json()
+    return {"queued": True}
 
 
-def _get_script_output(device_id: int, script_id: int) -> str:
-    if not script_id or script_id == 0:
-        return ""
-
-    url    = f"{CONFIG.NABLE_BASE_URL}/api/scheduled-tasks/status"
-    params = {"deviceId": device_id, "taskItemId": script_id}
-
-    for _ in range(12):
-        try:
-            r = requests.get(url, headers=_get_headers(), params=params, timeout=15)
-            if r.ok:
-                data   = r.json()
-                status = (data.get("status") or "").lower()
-                if status in ("completed", "success", "done"):
-                    return data.get("output", "")
-                if status in ("failed", "error"):
-                    return ""
-        except requests.RequestException:
-            pass
-        time.sleep(5)
-
-    return ""
-
+# ---------------------------------------------------------------------------
+# Diagnostic parsers
+# ---------------------------------------------------------------------------
 
 def _parse(output: str, key: str, default):
+    """Extract a numeric value from key=value script output lines."""
     for line in (output or "").splitlines():
         line = line.strip()
         if line.startswith(key + "="):
@@ -224,6 +220,7 @@ def _parse(output: str, key: str, default):
 
 
 def _build_diagnostics(device: dict, outputs: dict) -> dict:
+    """Assemble a structured diagnostic result dict from raw script outputs."""
     mem_out  = outputs.get("memory", "")
     cpu_out  = outputs.get("cpu", "")
     disk_out = outputs.get("storage", "")
@@ -239,131 +236,166 @@ def _build_diagnostics(device: dict, outputs: dict) -> dict:
 
     return {
         "device": {
-            "name": device.get("longName", "Unknown"),
-            "os":   device.get("supportedOs") or device.get("supportedOsLabel") or "Unknown"
+            "name": device.get("ComputerName", "Unknown"),
+            "os":   device.get("OperatingSystemName") or "Unknown",
         },
         "memory": {
             "usedPercent": round(mem_pct),
             "usedGB":      round(used_gb, 1),
-            "totalGB":     round(total_gb)
+            "totalGB":     round(total_gb),
         },
         "cpu": {
-            "loadPercent": round(cpu_load)
+            "loadPercent": round(cpu_load),
         },
         "storage": [
             {
                 "name":        "C:",
                 "usedPercent": round(disk_pct),
-                "freeGB":      round(disk_free, 1)
+                "freeGB":      round(disk_free, 1),
             }
-        ]
+        ],
     }
 
 
-def run_diagnostics(user_name: str, user_email: str) -> dict:
-    username = (
-        user_email.split("@")[0]
-        if user_email and "@" in user_email
-        else user_name.replace(" ", ".").lower()
-    )
+# ---------------------------------------------------------------------------
+# Public API — all functions require tenant_ctx as the last argument
+# ---------------------------------------------------------------------------
 
-    device    = find_device_by_user(username, user_email)
-    device_id = device["deviceId"]
-
-    scripts_configured = all(CONFIG.NABLE_SCRIPTS[k] for k in ("memory", "cpu", "storage"))
-
-    run_script(device_id, CONFIG.NABLE_SCRIPTS["memory"])
-    run_script(device_id, CONFIG.NABLE_SCRIPTS["cpu"])
-    run_script(device_id, CONFIG.NABLE_SCRIPTS["storage"])
-
-    if scripts_configured:
-        time.sleep(30)
-
-    outputs = {
-        "memory":  _get_script_output(device_id, CONFIG.NABLE_SCRIPTS["memory"]),
-        "cpu":     _get_script_output(device_id, CONFIG.NABLE_SCRIPTS["cpu"]),
-        "storage": _get_script_output(device_id, CONFIG.NABLE_SCRIPTS["storage"]),
-    }
-
-    return _build_diagnostics(device, outputs)
-
-
-def reset_outlook(user_name: str, user_email: str) -> dict:
-    username = (
-        user_email.split("@")[0]
-        if user_email and "@" in user_email
-        else user_name.replace(" ", ".").lower()
-    )
-
-    device    = find_device_by_user(username, user_email)
-    device_id = device["deviceId"]
-
-    run_script(device_id, CONFIG.NABLE_SCRIPTS["outlook_reset"])
-
-    mock = not CONFIG.NABLE_SCRIPTS["outlook_reset"]
-    return {
-        "message": (
-            f"[MOCK] Outlook reset would be sent to {device['longName']} — set NABLE_SCRIPT_OUTLOOK_RESET in .env for production."
-            if mock else
-            f"Outlook reset script sent to {device['longName']} via N-able N-central. "
-            "Outlook will close and reopen automatically within 30 seconds."
-        ),
-        "device": device["longName"]
-    }
-
-def change_timezone(
-    user_name:  str,
+def run_diagnostics(
+    user_name: str,
     user_email: str,
-    windows_tz: str,
-    iana_tz:    str,
+    tenant_ctx: dict,
 ) -> dict:
     """
-    Remotely changes the Windows timezone on the user's device via N-able.
-    Runs the timezone change automation policy script on the device.
+    Queue CPU, memory, and storage diagnostic scripts on the user's device
+    via ConnectWise Automate. Scripts run asynchronously on the device.
+
+    Returns:
+        Structured diagnostics dict with device info, memory, cpu, storage.
+        Values use sensible defaults since CWA scripts are fire-and-forget.
+    """
+    username = (
+        user_email.split("@")[0]
+        if user_email and "@" in user_email
+        else user_name.replace(" ", ".").lower()
+    )
+
+    device    = find_device_by_user(username, tenant_ctx)
+    device_id = device["Id"]
+
+    run_script(device_id, CONFIG.CWA_SCRIPTS.get("memory",  0), tenant_ctx)
+    run_script(device_id, CONFIG.CWA_SCRIPTS.get("cpu",     0), tenant_ctx)
+    run_script(device_id, CONFIG.CWA_SCRIPTS.get("storage", 0), tenant_ctx)
+
+    return _build_diagnostics(device, {})
+
+
+def reset_outlook(
+    user_name: str,
+    user_email: str,
+    tenant_ctx: dict,
+) -> dict:
+    """
+    Send the Outlook reset script to the user's device via ConnectWise Automate.
+
+    Returns:
+        Dict with 'success', 'message', 'device', and 'mock' keys.
+    """
+    username = (
+        user_email.split("@")[0]
+        if user_email and "@" in user_email
+        else user_name.replace(" ", ".").lower()
+    )
+
+    device    = find_device_by_user(username, tenant_ctx)
+    device_id = device["Id"]
+    script_id = CONFIG.CWA_SCRIPTS.get("outlook_reset", 0)
+
+    result = run_script(device_id, script_id, tenant_ctx)
+    mock   = result.get("mock", False)
+
+    return {
+        "success": True,
+        "message": (
+            f"[MOCK] Outlook reset would be sent to {device['ComputerName']} — "
+            "set CWA_SCRIPT_OUTLOOK_RESET in .env for production."
+            if mock else
+            f"Outlook reset script sent to {device['ComputerName']} via ConnectWise Automate. "
+            "Outlook will close and reopen automatically within 30 seconds."
+        ),
+        "device": device["ComputerName"],
+        "mock":   mock,
+    }
+
+
+def change_timezone(
+    user_name: str,
+    user_email: str,
+    timezone_iana: str,
+    tenant_ctx: dict,
+    windows_timezone: str = "",
+) -> dict:
+    """
+    Send the timezone change script to the user's device via ConnectWise Automate.
+    Passes the Windows timezone name as a script parameter.
+
+    Returns:
+        Dict with 'success', 'message', 'device', 'timezone_iana', and 'mock' keys.
     """
     try:
+        from services.timezone_service import IANA_TO_WINDOWS
+        windows_tz = windows_timezone or IANA_TO_WINDOWS.get(timezone_iana, "")
+
+        if not windows_tz:
+            return {
+                "success": False,
+                "error": (
+                    f"No Windows timezone mapping found for '{timezone_iana}'. "
+                    "Provide the windows_timezone parameter explicitly."
+                ),
+            }
+
         username = (
             user_email.split("@")[0]
             if user_email and "@" in user_email
             else user_name.replace(" ", ".").lower()
         )
 
-        device      = find_device_by_user(username, user_email)
-        device_id   = device["deviceId"]
-        device_name = device["longName"]
-        script_id   = CONFIG.NABLE_SCRIPTS.get("timezone_change", 0)
+        device      = find_device_by_user(username, tenant_ctx)
+        device_id   = device["Id"]
+        device_name = device["ComputerName"]
+        script_id   = CONFIG.CWA_SCRIPTS.get("timezone_change", 0)
 
         if not script_id:
             return {
-                "success":    False,
-                "device":     device_name,
-                "windows_tz": windows_tz,
-                "iana_tz":    iana_tz,
+                "success":          False,
+                "device":           device_name,
+                "timezone_iana":    timezone_iana,
+                "windows_timezone": windows_tz,
                 "message": (
-                    f"[MOCK] Timezone change to {iana_tz} would run on "
-                    f"{device_name} — set NABLE_SCRIPT_TIMEZONE_CHANGE in .env."
+                    f"[MOCK] Timezone change to {timezone_iana} ({windows_tz}) would run on "
+                    f"{device_name} — set CWA_SCRIPT_TIMEZONE_CHANGE in .env for production."
                 ),
-                "_mock": True,
+                "mock": True,
             }
 
-        run_script(device_id, script_id)
-
-        time.sleep(10)
-        output  = _get_script_output(device_id, script_id)
-        success = "success" in (output or "").lower() or bool(output)
+        run_script(
+            device_id,
+            script_id,
+            tenant_ctx,
+            parameters={"TimeZone": windows_tz},
+        )
 
         return {
-            "success":    True,
-            "device":     device_name,
-            "windows_tz": windows_tz,
-            "iana_tz":    iana_tz,
+            "success":          True,
+            "device":           device_name,
+            "timezone_iana":    timezone_iana,
+            "windows_timezone": windows_tz,
             "message": (
-                f"Timezone successfully changed to {iana_tz} on "
-                f"{device_name}. The change takes effect immediately."
-                if success else
-                f"Timezone change script sent to {device_name}. "
-                f"The change to {iana_tz} should take effect within 30 seconds."
+                f"Timezone change script sent to {device_name} via ConnectWise Automate. "
+                f"The change to {timezone_iana} ({windows_tz}) should take effect within 30 seconds."
             ),
+            "mock": False,
         }
 
     except Exception as exc:

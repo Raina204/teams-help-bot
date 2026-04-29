@@ -7,7 +7,7 @@ def get_welcome_card(user_name: str = "") -> dict:
         "body": [
             {
                 "type": "TextBlock",
-                "text": f"👋 {greeting}",
+                "text": f" {greeting}",
                 "weight": "Bolder",
                 "size": "Large",
                 "wrap": True
@@ -29,23 +29,38 @@ def get_welcome_card(user_name: str = "") -> dict:
         "actions": [
             {
                 "type": "Action.Submit",
-                "title": "🎫 Log a support ticket",
+                "title": "Log a support ticket",
                 "data": {"intent": "CREATE_TICKET"}
             },
             {
                 "type": "Action.Submit",
-                "title": "🔍 Run PC diagnostics",
+                "title": "Run PC diagnostics",
                 "data": {"intent": "RUN_DIAGNOSTICS"}
             },
             {
                 "type": "Action.Submit",
-                "title": "📧 Fix my Outlook",
+                "title": "Fix my Outlook",
                 "data": {"intent": "RESET_OUTLOOK"}
             },
             {
                 "type": "Action.Submit",
-                "title": "📋 Check my ticket status",
+                "title": "Check my ticket status",
                 "data": {"intent": "CHECK_TICKET"}
-            }
+            },
+            {
+                "type": "Action.Submit",
+                "title": "Change Timezone",
+                "data": {"intent": "CHANGE_TIMEZONE"}
+            },
+            {
+                "type": "Action.Submit",
+                "title": "Printer Issues",
+                "data": {"intent": "PRINTER_STATUS"}
+            },
+            {
+                "type": "Action.Submit",
+                "title": "Restart Printer Spooler",
+                "data": {"intent": "RESTART_SPOOLER"}
+            },
         ]
     }

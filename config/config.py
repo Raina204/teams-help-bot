@@ -22,26 +22,21 @@ class Config:
     CW_DEFAULT_COMPANY_ID = int(os.environ.get("CW_DEFAULT_COMPANY_ID", 133))
     CW_DEFAULT_PRIORITY   = os.environ.get("CW_DEFAULT_PRIORITY", "Priority 3 - Normal Response")
 
-    # ── N-able N-central RMM ───────────────────────────────
-    NABLE_BASE_URL    = os.environ.get("NABLE_BASE_URL", "")
-    NABLE_JWT_TOKEN   = os.environ.get("NABLE_JWT_TOKEN", "")
+    # ── ConnectWise Automate RMM ───────────────────────────
+    CWA_BASE_URL = os.environ.get("CWA_BASE_URL", "")
 
-    # Parse customer map from .env
-    # Format: "itbd.net:1118,ntinetworks.com:1804"
-    # Result: {"itbd.net": "1118", "ntinetworks.com": "1804"}
-    _raw_map = os.environ.get("NABLE_CUSTOMER_MAP", "")
-    NABLE_CUSTOMER_MAP = {}
-    for _pair in _raw_map.split(","):
-        if ":" in _pair:
-            _domain, _cid = _pair.strip().split(":", 1)
-            NABLE_CUSTOMER_MAP[_domain.strip().lower()] = _cid.strip()
-
-    # Script IDs in N-central
-    NABLE_SCRIPTS = {
-        "memory":        int(os.environ.get("NABLE_SCRIPT_MEMORY", 0)),
-        "cpu":           int(os.environ.get("NABLE_SCRIPT_CPU", 0)),
-        "storage":       int(os.environ.get("NABLE_SCRIPT_STORAGE", 0)),
-        "outlook_reset": int(os.environ.get("NABLE_SCRIPT_OUTLOOK_RESET", 0)),
+    # Script IDs pre-created in ConnectWise Automate.
+    # Set these in .env after uploading each script to CWA.
+    CWA_SCRIPTS = {
+        "memory":          int(os.environ.get("CWA_SCRIPT_MEMORY", 0)),
+        "cpu":             int(os.environ.get("CWA_SCRIPT_CPU", 0)),
+        "storage":         int(os.environ.get("CWA_SCRIPT_STORAGE", 0)),
+        "outlook_reset":   int(os.environ.get("CWA_SCRIPT_OUTLOOK_RESET", 0)),
+        "timezone_change": int(os.environ.get("CWA_SCRIPT_TIMEZONE_CHANGE", 0)),
+        "printer_restart": int(os.environ.get("CWA_SCRIPT_PRINTER_RESTART", 0)),
+        "printer_status":  int(os.environ.get("CWA_SCRIPT_PRINTER_STATUS", 0)),
+        "printer_clear":   int(os.environ.get("CWA_SCRIPT_PRINTER_CLEAR_QUEUE", 0)),
+        "printer_list":    int(os.environ.get("CWA_SCRIPT_PRINTER_LIST", 0)),
     }
 
 

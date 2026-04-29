@@ -1,237 +1,163 @@
 """
 services/printer_service.py
-───────────────────────────────────────────────────────────────────────────────
-Printer Spooler Service — integrates with N-able RMM to manage the Windows
-Print Spooler service on a user's machine under a multi-tenant setup.
+────────────────────────────────────────────────────────────────────────────
+Printer Spooler Service — multi-tenant aware.
+
+Integrates with ConnectWise Automate (CWA) RMM to manage the Windows Print
+Spooler on a user's machine. Every public function accepts tenant_ctx as its
+last argument.
 
 Capabilities
 ------------
-  • restart_print_spooler(user_email)   — stops spooler, clears stuck jobs, restarts
-  • check_printer_status(user_email)    — reports spooler state + queued jobs
-  • clear_print_queue(user_email)       — clears stuck jobs without restart
-  • list_printers(user_email)           — lists all printers installed on device
+  • restart_spooler(user_email, tenant_ctx)       — stops spooler, clears stuck jobs, restarts
+  • check_printer_status(user_email, tenant_ctx)  — reports spooler state + queued jobs
+  • clear_queue(user_email, tenant_ctx)           — clears stuck jobs without restart
+  • list_printers(user_email, tenant_ctx)         — lists all printers installed on device
 
-All methods fall back to mock mode when NABLE_JWT_TOKEN is empty.
-Multi-tenant support via NABLE_CUSTOMER_MAP (same as rmm_service.py).
+Per-tenant values used from tenant_ctx:
+  - cwa_api_key_ref   → resolved via get_secret() to the CWA Bearer token
+  - cwa_base_url      → this tenant's ConnectWise Automate server URL
+  - printer_sites     → list of permitted printer sites for this tenant
+  - mock              → True = always use mock responses (no real API calls)
+
+Scripts must be pre-created in ConnectWise Automate and their IDs set in .env:
+  CWA_SCRIPT_PRINTER_RESTART
+  CWA_SCRIPT_PRINTER_STATUS
+  CWA_SCRIPT_PRINTER_CLEAR_QUEUE
+  CWA_SCRIPT_PRINTER_LIST
 """
 
-import os
-import json
 import logging
-import requests
 from datetime import datetime
-from config.config import Config
+
+import requests
+
+from config.config import CONFIG
+from config.secrets import get_secret
+from services.rmm_service import _get_headers, _get_base_url
 
 logger = logging.getLogger(__name__)
 
 
-# ── PowerShell scripts uploaded to N-able on demand ──────────────────────────
+# ── Internal helpers ──────────────────────────────────────────────────────────
 
-SCRIPT_RESTART_SPOOLER = r"""
-# Restart-PrintSpooler.ps1
-# Stops the Print Spooler, clears stuck jobs, and restarts it.
-$spoolerPath = "$env:SystemRoot\System32\spool\PRINTERS"
-
-Write-Output "=== Print Spooler Restart ==="
-Write-Output "Timestamp: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-
-# Stop spooler
-Write-Output "Stopping Print Spooler service..."
-Stop-Service -Name Spooler -Force -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 2
-
-# Clear spool files
-$files = Get-ChildItem -Path $spoolerPath -ErrorAction SilentlyContinue
-$count = ($files | Measure-Object).Count
-if ($count -gt 0) {
-    Remove-Item "$spoolerPath\*" -Force -Recurse -ErrorAction SilentlyContinue
-    Write-Output "Cleared $count stuck print job(s)."
-} else {
-    Write-Output "No stuck jobs found in spool folder."
-}
-
-# Restart spooler
-Start-Service -Name Spooler -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 2
-
-$svc = Get-Service -Name Spooler
-Write-Output "Print Spooler status: $($svc.Status)"
-
-if ($svc.Status -eq 'Running') {
-    Write-Output "SUCCESS: Print Spooler restarted successfully."
-    exit 0
-} else {
-    Write-Output "ERROR: Print Spooler failed to start. Manual intervention needed."
-    exit 1
-}
-"""
-
-SCRIPT_CHECK_STATUS = r"""
-# Check-PrinterStatus.ps1
-$svc = Get-Service -Name Spooler -ErrorAction SilentlyContinue
-$spoolerPath = "$env:SystemRoot\System32\spool\PRINTERS"
-$stuckJobs   = (Get-ChildItem -Path $spoolerPath -ErrorAction SilentlyContinue | Measure-Object).Count
-$printers    = Get-Printer | Select-Object Name, PrinterStatus, DriverName
-
-Write-Output "=== Printer Status Report ==="
-Write-Output "Timestamp: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
-Write-Output "Spooler Service: $($svc.Status)"
-Write-Output "Stuck Jobs in Spool: $stuckJobs"
-Write-Output ""
-Write-Output "--- Installed Printers ---"
-foreach ($p in $printers) {
-    Write-Output "Printer: $($p.Name) | Status: $($p.PrinterStatus) | Driver: $($p.DriverName)"
-}
-"""
-
-SCRIPT_CLEAR_QUEUE = r"""
-# Clear-PrintQueue.ps1
-$spoolerPath = "$env:SystemRoot\System32\spool\PRINTERS"
-
-Stop-Service -Name Spooler -Force -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 2
-
-$files = Get-ChildItem -Path $spoolerPath -ErrorAction SilentlyContinue
-$count = ($files | Measure-Object).Count
-Remove-Item "$spoolerPath\*" -Force -Recurse -ErrorAction SilentlyContinue
-
-Start-Service -Name Spooler -ErrorAction SilentlyContinue
-Start-Sleep -Seconds 2
-
-Write-Output "Cleared $count print job(s). Spooler restarted."
-$svc = Get-Service -Name Spooler
-Write-Output "Spooler status: $($svc.Status)"
-"""
-
-SCRIPT_LIST_PRINTERS = r"""
-# List-Printers.ps1
-$printers = Get-Printer | Select-Object Name, PrinterStatus, DriverName, PortName, Shared
-Write-Output "=== Installed Printers ==="
-foreach ($p in $printers) {
-    Write-Output "Name: $($p.Name)"
-    Write-Output "  Status : $($p.PrinterStatus)"
-    Write-Output "  Driver : $($p.DriverName)"
-    Write-Output "  Port   : $($p.PortName)"
-    Write-Output "  Shared : $($p.Shared)"
-    Write-Output "---"
-}
-"""
-
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _get_customer_id(user_email: str) -> int | None:
-    """Resolve a user's email domain → N-able customer ID using NABLE_CUSTOMER_MAP."""
-    customer_map_raw = os.environ.get("NABLE_CUSTOMER_MAP", "")
-    if not customer_map_raw:
-        return None
-    domain = user_email.split("@")[-1].lower()
-    for pair in customer_map_raw.split(","):
-        if ":" in pair:
-            d, cid = pair.strip().split(":", 1)
-            if d.strip().lower() == domain:
-                return int(cid.strip())
-    return None
-
-
-def _nable_headers() -> dict:
-    token = os.environ.get("NABLE_JWT_TOKEN", "")
-    return {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-    }
-
-
-def _find_device(user_email: str) -> dict | None:
+def _use_mock(tenant_ctx: dict) -> bool:
     """
-    Look up the user's device in N-able by email/username.
-    Returns device dict with at least {'id': ..., 'hostname': ...} or None.
+    Return True if mock mode should be used for this tenant.
+
+    Mock mode is active when:
+      - tenant_ctx["mock"] is True, OR
+      - tenant_ctx["cwa_mock"] is True, OR
+      - the tenant's CWA API token resolves to empty/placeholder
     """
-    base_url = os.environ.get("NABLE_BASE_URL", "").rstrip("/")
-    customer_id = _get_customer_id(user_email)
+    if tenant_ctx.get("mock") or tenant_ctx.get("cwa_mock"):
+        return True
+    try:
+        token = get_secret(tenant_ctx["cwa_api_key_ref"])
+        return not token or token.startswith("mock-")
+    except Exception:
+        return True
+
+
+def _find_device(user_email: str, tenant_ctx: dict) -> dict | None:
+    """
+    Look up the user's device in this tenant's ConnectWise Automate instance.
+
+    CWA endpoint: GET /cwa/api/v1/computers?condition=LastLoggedInUser like '%{user}%'
+
+    Returns:
+        Computer dict with at least {'Id': ..., 'ComputerName': ...}, or None.
+    """
+    base_url = _get_base_url(tenant_ctx)
     username = user_email.split("@")[0]
 
     try:
-        params = {"customerid": customer_id} if customer_id else {}
-        params["username"] = username
         resp = requests.get(
-            f"{base_url}/api/devices",
-            headers=_nable_headers(),
-            params=params,
+            f"{base_url}/cwa/api/v1/computers",
+            headers=_get_headers(tenant_ctx),
+            params={"condition": f"LastLoggedInUser like '%{username}%'", "pageSize": 50},
             timeout=15,
         )
         resp.raise_for_status()
-        devices = resp.json().get("devices", [])
-        return devices[0] if devices else None
+
+        computers = resp.json()
+        if isinstance(computers, dict):
+            computers = computers.get("data", [])
+
+        lower_user = username.lower()
+
+        def _strip_domain(raw: str) -> str:
+            raw = (raw or "").lower()
+            return raw.split("\\")[-1] if "\\" in raw else raw
+
+        for c in computers:
+            if lower_user == _strip_domain(c.get("LastLoggedInUser", "")):
+                return c
+        for c in computers:
+            if lower_user in _strip_domain(c.get("LastLoggedInUser", "")):
+                return c
+        for c in computers:
+            if lower_user.split(".")[0] in _strip_domain(c.get("LastLoggedInUser", "")):
+                return c
+
+        return None
+
     except Exception as exc:
-        logger.error("N-able device lookup failed: %s", exc)
+        logger.error(
+            "[PrinterService] Device lookup failed — tenant=%s error=%s",
+            tenant_ctx.get("tenant_id"), exc,
+        )
         return None
 
 
-def _run_inline_script(device_id: int, script_body: str, script_name: str) -> dict:
+def _run_script(
+    device_id: int,
+    script_id: int,
+    tenant_ctx: dict,
+) -> dict:
     """
-    Upload a PowerShell script to N-able and immediately run it on device_id.
-    Returns {'success': bool, 'output': str}.
+    Run a ConnectWise Automate script on device_id.
+
+    CWA endpoint: POST /cwa/api/v1/computers/{computerId}/scripts/{scriptId}
+
+    Args:
+        device_id:   CWA computer ID.
+        script_id:   CWA script ID from .env.
+        tenant_ctx:  Resolved tenant config dict.
+
+    Returns:
+        Dict with 'success' (bool) and 'output' (str).
     """
-    base_url = os.environ.get("NABLE_BASE_URL", "").rstrip("/")
-    headers  = _nable_headers()
+    if not script_id:
+        return {"success": False, "output": "Script ID not configured."}
+
+    base_url = _get_base_url(tenant_ctx)
 
     try:
-        # 1. Upload script
-        upload_resp = requests.post(
-            f"{base_url}/api/script-management/scripts",
-            headers=headers,
-            json={
-                "name":        script_name,
-                "description": f"Auto-uploaded by Teams bot — {script_name}",
-                "scriptType":  "PowerShell",
-                "content":     script_body,
-            },
+        resp = requests.post(
+            f"{base_url}/cwa/api/v1/computers/{device_id}/scripts/{script_id}",
+            headers=_get_headers(tenant_ctx),
             timeout=20,
         )
-        upload_resp.raise_for_status()
-        script_id = upload_resp.json().get("scriptId") or upload_resp.json().get("id")
-
-        # 2. Run script on device
-        run_resp = requests.post(
-            f"{base_url}/api/script-management/scripts/{script_id}/run",
-            headers=headers,
-            json={"deviceIds": [device_id]},
-            timeout=20,
-        )
-        run_resp.raise_for_status()
-        job_id = run_resp.json().get("jobId")
-
-        # 3. Poll for result (up to 30 s)
-        import time
-        for _ in range(6):
-            time.sleep(5)
-            result_resp = requests.get(
-                f"{base_url}/api/script-management/jobs/{job_id}",
-                headers=headers,
-                timeout=15,
-            )
-            data = result_resp.json()
-            if data.get("status") in ("Completed", "Failed"):
-                output = data.get("output", "")
-                success = "SUCCESS" in output or data.get("status") == "Completed"
-                return {"success": success, "output": output, "script_id": script_id}
-
-        return {"success": False, "output": "Script timed out waiting for result."}
+        resp.raise_for_status()
+        return {"success": True, "output": "Script queued successfully."}
 
     except Exception as exc:
-        logger.error("N-able script execution error: %s", exc)
+        logger.error(
+            "[PrinterService] Script execution error — tenant=%s script=%s error=%s",
+            tenant_ctx.get("tenant_id"), script_id, exc,
+        )
         return {"success": False, "output": str(exc)}
 
 
-# ── Mock responses (used when NABLE_JWT_TOKEN is blank) ──────────────────────
+# ── Mock responses ────────────────────────────────────────────────────────────
 
-def _mock_restart_spooler() -> dict:
+def _mock_restart_spooler(tenant_ctx: dict) -> dict:
+    tid = tenant_ctx.get("tenant_id", "mock").upper()
     return {
         "success":  True,
-        "hostname": "MOCK-PC-001",
-        "output":   (
+        "hostname": f"MOCK-PC-{tid}-001",
+        "output": (
             "=== Print Spooler Restart ===\n"
             f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             "Stopping Print Spooler service...\n"
@@ -239,128 +165,163 @@ def _mock_restart_spooler() -> dict:
             "Print Spooler status: Running\n"
             "SUCCESS: Print Spooler restarted successfully."
         ),
-        "mock": True,
+        "tenant_id": tenant_ctx.get("tenant_id"),
+        "mock":      True,
     }
 
 
-def _mock_check_status() -> dict:
+def _mock_check_status(tenant_ctx: dict) -> dict:
+    tid   = tenant_ctx.get("tenant_id", "mock").upper()
+    sites = tenant_ctx.get("printer_sites", ["Office"])
+    site  = sites[0] if sites else "Office"
     return {
         "success":  True,
-        "hostname": "MOCK-PC-001",
-        "output":   (
+        "hostname": f"MOCK-PC-{tid}-001",
+        "output": (
             "=== Printer Status Report ===\n"
             f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             "Spooler Service: Running\n"
             "Stuck Jobs in Spool: 0\n\n"
             "--- Installed Printers ---\n"
-            "Printer: HP LaserJet Pro M404 | Status: Normal | Driver: HP LaserJet Pro\n"
-            "Printer: Microsoft Print to PDF | Status: Normal | Driver: Microsoft Print To PDF\n"
-            "Printer: OneNote | Status: Normal | Driver: Microsoft Shared Fax Driver"
+            f"Printer: {site} HP LaserJet Pro | Status: Normal | Driver: HP LaserJet Pro\n"
+            "Printer: Microsoft Print to PDF | Status: Normal | Driver: Microsoft Print To PDF"
         ),
-        "mock": True,
+        "tenant_id": tenant_ctx.get("tenant_id"),
+        "mock":      True,
     }
 
 
-def _mock_clear_queue() -> dict:
+def _mock_clear_queue(tenant_ctx: dict) -> dict:
+    tid = tenant_ctx.get("tenant_id", "mock").upper()
     return {
         "success":  True,
-        "hostname": "MOCK-PC-001",
+        "hostname": f"MOCK-PC-{tid}-001",
         "output":   "Cleared 2 print job(s). Spooler restarted.\nSpooler status: Running",
-        "mock": True,
+        "tenant_id": tenant_ctx.get("tenant_id"),
+        "mock":      True,
     }
 
 
-def _mock_list_printers() -> dict:
-    return {
-        "success":  True,
-        "hostname": "MOCK-PC-001",
-        "output":   (
-            "=== Installed Printers ===\n"
-            "Name: HP LaserJet Pro M404\n"
+def _mock_list_printers(tenant_ctx: dict) -> dict:
+    tid   = tenant_ctx.get("tenant_id", "mock").upper()
+    sites = tenant_ctx.get("printer_sites", ["Office"])
+
+    printer_lines = []
+    for site in sites:
+        printer_lines.append(
+            f"Name: {site} HP LaserJet Pro\n"
             "  Status : Normal\n"
             "  Driver : HP LaserJet Pro M402-M403 PCL 6\n"
             "  Port   : 192.168.1.50\n"
-            "  Shared : False\n---\n"
-            "Name: Microsoft Print to PDF\n"
-            "  Status : Normal\n"
-            "  Driver : Microsoft Print To PDF\n"
-            "  Port   : PORTPROMPT:\n"
             "  Shared : False\n---"
-        ),
-        "mock": True,
+        )
+    printer_lines.append(
+        "Name: Microsoft Print to PDF\n"
+        "  Status : Normal\n"
+        "  Driver : Microsoft Print To PDF\n"
+        "  Port   : PORTPROMPT:\n"
+        "  Shared : False\n---"
+    )
+
+    return {
+        "success":  True,
+        "hostname": f"MOCK-PC-{tid}-001",
+        "output":   "=== Installed Printers ===\n" + "\n".join(printer_lines),
+        "printers": [f"{s} HP LaserJet Pro" for s in sites] + ["Microsoft Print to PDF"],
+        "tenant_id": tenant_ctx.get("tenant_id"),
+        "mock":      True,
     }
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def restart_print_spooler(user_email: str) -> dict:
+def restart_spooler(user_email: str, tenant_ctx: dict) -> dict:
     """
-    Restart the Windows Print Spooler on the user's machine via N-able RMM.
-    Clears the spool folder before restarting.
-    Returns: {success, hostname, output, mock?}
-    """
-    if not os.environ.get("NABLE_JWT_TOKEN"):
-        logger.info("[PrinterService] Mock mode — restart_print_spooler")
-        return _mock_restart_spooler()
+    Restart the Windows Print Spooler on the user's machine via ConnectWise Automate.
 
-    device = _find_device(user_email)
+    Requires CWA_SCRIPT_PRINTER_RESTART to be set in .env.
+    """
+    if _use_mock(tenant_ctx):
+        logger.info("[PrinterService] Mock mode — restart_spooler tenant=%s", tenant_ctx.get("tenant_id"))
+        return _mock_restart_spooler(tenant_ctx)
+
+    device = _find_device(user_email, tenant_ctx)
     if not device:
-        return {"success": False, "output": f"Could not find device for {user_email}."}
+        return {
+            "success": False,
+            "output":  f"Could not find device for {user_email} in tenant '{tenant_ctx.get('tenant_id')}'.",
+        }
 
-    result = _run_inline_script(device["id"], SCRIPT_RESTART_SPOOLER, "Restart-PrintSpooler")
-    result["hostname"] = device.get("hostname", "Unknown")
+    result = _run_script(device["Id"], CONFIG.CWA_SCRIPTS.get("printer_restart", 0), tenant_ctx)
+    result["hostname"]  = device.get("ComputerName", "Unknown")
+    result["tenant_id"] = tenant_ctx.get("tenant_id")
     return result
 
 
-def check_printer_status(user_email: str) -> dict:
+def check_printer_status(user_email: str, tenant_ctx: dict) -> dict:
     """
-    Return Print Spooler state + list of installed printers for the user's machine.
-    Returns: {success, hostname, output, mock?}
-    """
-    if not os.environ.get("NABLE_JWT_TOKEN"):
-        logger.info("[PrinterService] Mock mode — check_printer_status")
-        return _mock_check_status()
+    Return Print Spooler state and list of installed printers for the user's machine.
 
-    device = _find_device(user_email)
+    Requires CWA_SCRIPT_PRINTER_STATUS to be set in .env.
+    """
+    if _use_mock(tenant_ctx):
+        logger.info("[PrinterService] Mock mode — check_printer_status tenant=%s", tenant_ctx.get("tenant_id"))
+        return _mock_check_status(tenant_ctx)
+
+    device = _find_device(user_email, tenant_ctx)
     if not device:
-        return {"success": False, "output": f"Could not find device for {user_email}."}
+        return {
+            "success": False,
+            "output":  f"Could not find device for {user_email} in tenant '{tenant_ctx.get('tenant_id')}'.",
+        }
 
-    result = _run_inline_script(device["id"], SCRIPT_CHECK_STATUS, "Check-PrinterStatus")
-    result["hostname"] = device.get("hostname", "Unknown")
+    result = _run_script(device["Id"], CONFIG.CWA_SCRIPTS.get("printer_status", 0), tenant_ctx)
+    result["hostname"]  = device.get("ComputerName", "Unknown")
+    result["tenant_id"] = tenant_ctx.get("tenant_id")
     return result
 
 
-def clear_print_queue(user_email: str) -> dict:
+def clear_queue(user_email: str, tenant_ctx: dict) -> dict:
     """
-    Clear all stuck print jobs without a full spooler restart — faster for minor jams.
-    Returns: {success, hostname, output, mock?}
-    """
-    if not os.environ.get("NABLE_JWT_TOKEN"):
-        logger.info("[PrinterService] Mock mode — clear_print_queue")
-        return _mock_clear_queue()
+    Clear all stuck print jobs without a full spooler restart.
 
-    device = _find_device(user_email)
+    Requires CWA_SCRIPT_PRINTER_CLEAR_QUEUE to be set in .env.
+    """
+    if _use_mock(tenant_ctx):
+        logger.info("[PrinterService] Mock mode — clear_queue tenant=%s", tenant_ctx.get("tenant_id"))
+        return _mock_clear_queue(tenant_ctx)
+
+    device = _find_device(user_email, tenant_ctx)
     if not device:
-        return {"success": False, "output": f"Could not find device for {user_email}."}
+        return {
+            "success": False,
+            "output":  f"Could not find device for {user_email} in tenant '{tenant_ctx.get('tenant_id')}'.",
+        }
 
-    result = _run_inline_script(device["id"], SCRIPT_CLEAR_QUEUE, "Clear-PrintQueue")
-    result["hostname"] = device.get("hostname", "Unknown")
+    result = _run_script(device["Id"], CONFIG.CWA_SCRIPTS.get("printer_clear", 0), tenant_ctx)
+    result["hostname"]  = device.get("ComputerName", "Unknown")
+    result["tenant_id"] = tenant_ctx.get("tenant_id")
     return result
 
 
-def list_printers(user_email: str) -> dict:
+def list_printers(user_email: str, tenant_ctx: dict) -> dict:
     """
     List all printers installed on the user's machine with status and driver info.
-    Returns: {success, hostname, output, mock?}
+
+    Requires CWA_SCRIPT_PRINTER_LIST to be set in .env.
     """
-    if not os.environ.get("NABLE_JWT_TOKEN"):
-        logger.info("[PrinterService] Mock mode — list_printers")
-        return _mock_list_printers()
+    if _use_mock(tenant_ctx):
+        logger.info("[PrinterService] Mock mode — list_printers tenant=%s", tenant_ctx.get("tenant_id"))
+        return _mock_list_printers(tenant_ctx)
 
-    device = _find_device(user_email)
+    device = _find_device(user_email, tenant_ctx)
     if not device:
-        return {"success": False, "output": f"Could not find device for {user_email}."}
+        return {
+            "success": False,
+            "output":  f"Could not find device for {user_email} in tenant '{tenant_ctx.get('tenant_id')}'.",
+        }
 
-    result = _run_inline_script(device["id"], SCRIPT_LIST_PRINTERS, "List-Printers")
-    result["hostname"] = device.get("hostname", "Unknown")
+    result = _run_script(device["Id"], CONFIG.CWA_SCRIPTS.get("printer_list", 0), tenant_ctx)
+    result["hostname"]  = device.get("ComputerName", "Unknown")
+    result["tenant_id"] = tenant_ctx.get("tenant_id")
     return result

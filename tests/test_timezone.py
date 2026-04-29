@@ -7,6 +7,22 @@ import sys
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+MOCK_TENANT = {
+    "tenant_id":  "test-tenant",
+    "user_email": "john.smith@itbd.net",
+    "allowed_actions": [
+        "CHANGE_TIMEZONE",
+        "RUN_DIAGNOSTICS",
+        "RESET_OUTLOOK",
+        "RESTART_SPOOLER",
+        "CHECK_PRINTER_STATUS",
+        "CLEAR_PRINT_QUEUE",
+        "LIST_PRINTERS",
+        "CREATE_TICKET",
+    ],
+}
+
+
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from services.timezone_service import IANA_TO_WINDOWS, get_timezone_command
@@ -265,6 +281,7 @@ class TestHandleTimezoneRequest(unittest.IsolatedAsyncioTestCase):
                 context, user_text,
                 "John Smith", "john.smith@itbd.net",
                 conv,
+                MOCK_TENANT,
             )
 
         return context, conv
@@ -347,7 +364,7 @@ class TestHandleTimezoneRequest(unittest.IsolatedAsyncioTestCase):
 
         with patch.dict(os.environ, {"OPENAI_API_KEY": ""}), \
              patch("dialogs.main_dialog.cw.create_ticket", return_value=mock_ticket):
-            await handle_turn(context, conv)
+            await handle_turn(context, conv, MOCK_TENANT)
 
         self.assertNotIn("pending_timezone_ticket", conv)
         self.assertIn("9001", _all_replies(context))
@@ -365,7 +382,7 @@ class TestHandleTimezoneRequest(unittest.IsolatedAsyncioTestCase):
 
         with patch.dict(os.environ, {"OPENAI_API_KEY": ""}), \
              patch("dialogs.main_dialog.cw.create_ticket") as mock_cw:
-            await handle_turn(context, conv)
+            await handle_turn(context, conv, MOCK_TENANT)
             mock_cw.assert_not_called()
 
         self.assertNotIn("pending_timezone_ticket", conv)
@@ -385,7 +402,7 @@ class TestHandleTimezoneRequest(unittest.IsolatedAsyncioTestCase):
              patch("dialogs.main_dialog.cw.create_ticket") as mock_cw, \
              patch("dialogs.main_dialog._handle_main_menu",
                    new_callable=AsyncMock) as mock_menu:
-            await handle_turn(context, conv)
+            await handle_turn(context, conv, MOCK_TENANT)
             mock_cw.assert_not_called()
             mock_menu.assert_called_once()
 
@@ -411,7 +428,7 @@ class TestHandleTimezoneRequest(unittest.IsolatedAsyncioTestCase):
                 with patch.dict(os.environ, {"OPENAI_API_KEY": ""}), \
                      patch("dialogs.main_dialog.cw.create_ticket",
                            return_value={"id": 1}):
-                    await handle_turn(context, conv)
+                    await handle_turn(context, conv, MOCK_TENANT)
 
                 self.assertNotIn(
                     "pending_timezone_ticket", conv,
@@ -432,7 +449,7 @@ class TestHandleTimezoneRequest(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"OPENAI_API_KEY": ""}), \
              patch("dialogs.main_dialog.cw.create_ticket",
                    side_effect=Exception("ConnectWise API unavailable")):
-            await handle_turn(context, conv)
+            await handle_turn(context, conv, MOCK_TENANT)
 
         replies = _all_replies(context)
         self.assertTrue(
@@ -459,6 +476,7 @@ class TestHandleTimezoneRequest(unittest.IsolatedAsyncioTestCase):
                 context, "set timezone to Tokyo",
                 "John Smith", "john.smith@itbd.net",
                 conv,
+                MOCK_TENANT,
             )
 
         replies = _all_replies(context)
@@ -471,6 +489,16 @@ class TestHandleTimezoneRequest(unittest.IsolatedAsyncioTestCase):
 # ---------------------------------------------------------------------------
 
 class TestTimezoneEndToEnd(unittest.IsolatedAsyncioTestCase):
+
+    async def _run(self, message: str, payload=None):
+        from dialogs.main_dialog import handle_turn
+        conv = {}
+        context = _make_turn_context(message)
+        with patch.dict(os.environ, {"OPENAI_API_KEY": ""}), \
+             patch("dialogs.main_dialog.aiohttp.ClientSession",
+                   _make_session_mock(payload)):
+            await handle_turn(context, conv, MOCK_TENANT)
+        return context, conv
 
     async def test_full_two_turn_flow(self):
         from dialogs.main_dialog import handle_turn
@@ -490,7 +518,7 @@ class TestTimezoneEndToEnd(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"OPENAI_API_KEY": ""}), \
              patch("dialogs.main_dialog.aiohttp.ClientSession",
                    _make_session_mock(openai_payload)):
-            await handle_turn(context_1, conv)
+            await handle_turn(context_1, conv, MOCK_TENANT)
 
         self.assertIn("pending_timezone_ticket", conv)
         self.assertIn("Central Time (Chicago)", _all_replies(context_1))
@@ -502,11 +530,10 @@ class TestTimezoneEndToEnd(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"OPENAI_API_KEY": ""}), \
              patch("dialogs.main_dialog.cw.create_ticket",
                    return_value=mock_ticket):
-            await handle_turn(context_2, conv)
+            await handle_turn(context_2, conv, MOCK_TENANT)
 
         self.assertNotIn("pending_timezone_ticket", conv)
         self.assertIn("5050", _all_replies(context_2))
-
 
 # ---------------------------------------------------------------------------
 # Entry point

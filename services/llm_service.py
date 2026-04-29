@@ -35,8 +35,13 @@ You help employees with:
   • Creating ConnectWise support tickets for IT issues
   • Checking the status of existing tickets
   • Adding notes to open tickets
-  • Running PC health diagnostics (memory, CPU, storage) via N-able
+  • Running PC health diagnostics (memory, CPU, storage) via ConnectWise Automate
   • Resetting Outlook profiles when Outlook is broken
+  • Restarting the Windows print spooler service when printing is not working
+  • Checking printer and spooler status
+  • Clearing a stuck print queue
+  • Listing installed printers on a device
+  • Changing the system timezone on Windows, macOS, or Linux
 
 How to behave:
   • Be concise and friendly. Employees have real IT problems to solve.
@@ -47,6 +52,12 @@ How to behave:
   • For diagnostics: run them immediately, no confirmation needed.
   • For Outlook reset: it closes and wipes Outlook's cache — always
     warn the user and confirm before calling reset_outlook.
+  • For printer issues (can't print, stuck jobs, spooler errors): restart
+    the print spooler first — it resolves most printer problems. No
+    confirmation needed.
+  • For timezone changes: ask which timezone the user wants and which OS
+    they are on (Windows, macOS, or Linux) if not already clear from context.
+    Then run the change immediately — no further confirmation needed.
   • After creating a ticket, always show the ticket number clearly.
   • If you cannot help, direct the user to contact IT support directly.
 """
@@ -57,6 +68,7 @@ def process_message(
     conversation_history: list,
     user_name:            str = "",
     user_email:           str = "",
+    tenant_id:            str = "",
 ) -> str:
     try:
         client = _get_client()
@@ -88,7 +100,9 @@ def process_message(
             messages.append(choice.message)
 
             for tool_call in choice.message.tool_calls:
-                args   = json.loads(tool_call.function.arguments)
+                args = json.loads(tool_call.function.arguments)
+                args["user_tenant_id"] = tenant_id
+                args["user_email"]     = args.get("user_email") or user_email
                 result = execute_tool(tool_call.function.name, args)
                 print(
                     f"[llm_service] iter={iteration} "
